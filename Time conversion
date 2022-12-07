@@ -1,0 +1,112 @@
+@@ Sometimes (and I don't understand why) a time object is returned as a Time object and not as a String. This commit makes sure to accept both.
+@ -1,8 +1,4 @@
+
+
+
+tests: test4 test5 test6
+
+ test4:
+ 	SIMPLE_SQL_ACTIVERECORD_SPECS="> 4,< 5" bundle
+ 	bundle exec rspec
+ tests: test5 test6 test7
+
+ test5:
+ 	SIMPLE_SQL_ACTIVERECORD_SPECS="> 5,< 6" bundle update activerecord
+ @@ -12,6 +8,10 @@ test6:
+ 	SIMPLE_SQL_ACTIVERECORD_SPECS="> 6,< 7" bundle update activerecord
+ 	bundle exec rspec
+
+ test7:
+ 	SIMPLE_SQL_ACTIVERECORD_SPECS="> 7,< 8" bundle update activerecord
+ 	bundle exec rspec
+
+ stats:
+ 	@scripts/stats lib/simple/sql
+ 	@scripts/stats spec/simple/sql
+    9  
+lib/simple/sql/helpers/decoder.rb
+ 
+ @@ -18,8 +18,8 @@ def decode_value(type, s)
+     when :'integer[]'                   then s.scan(/-?\d+/).map { |part| Integer(part) }
+     when :"character varying[]"         then parse_pg_array(s)
+     when :"text[]"                      then parse_pg_array(s)
+     when :"timestamp without time zone" then ::Time.parse(s)
+     when :"timestamp with time zone"    then ::Time.parse(s)
+     when :"timestamp without time zone" then decode_time(s)
+     when :"timestamp with time zone"    then decode_time(s)
+     when :hstore                        then HStore.parse(s)
+     when :json                          then ::JSON.parse(s)
+     when :jsonb                         then ::JSON.parse(s)
+ @@ -36,6 +36,11 @@ def decode_value(type, s)
+   require "pg_array_parser"
+   extend PgArrayParser
+
+   def decode_time(s)
+     return s if s.is_a?(Time)
+     ::Time.parse(s)
+   end
+
+   # HStore parsing
+   module HStore
+     extend self
+    # thanks to https://github.com/engageis/activerecord-postgres-hstore for regexps!
+    QUOTED_LITERAL    = /"[^"\\]*(?:\\.[^"\\]*)*"/
+    UNQUOTED_LITERAL  = /[^\s=,][^\s=,\\]*(?:\\.[^\s=,\\]*|=[^,>])*/
+    LITERAL           = /(#{QUOTED_LITERAL}|#{UNQUOTED_LITERAL})/
+    PAIR              = /#{LITERAL}\s*=>\s*#{LITERAL}/
+    NULL              = /\ANULL\z/i
+    DOUBLE_QUOTE      = '"'.freeze
+    ESCAPED_CHAR      = /\\(.)/
+    def parse(hstore)
+      hstore.scan(PAIR).each_with_object({}) do |(k, v), memo|
+        k = unpack(k)
+        k = k.to_sym
+        v = v =~ NULL ? nil : unpack(v)
+        memo[k] = v
+      end
+    end
+    def unpack(string)
+      string = string[1..-2] if string[0] == DOUBLE_QUOTE # remove quotes, if any
+      string.gsub ESCAPED_CHAR, '\1'                      # unescape, if necessary
+    end
+  end
+end
+module Simple::SQL::Helpers::Decoder
+  def self.new(result, into:, column_info:)
+    if into == Hash           then HashRecord.new(column_info)
+    elsif result.nfields == 1 then SingleColumn.new(column_info)
+    else                           MultiColumns.new(column_info)
+    end
+  end
+  class SingleColumn
+    def initialize(column_info)
+      @field_type = column_info.first.fetch(:pg_type_name)
+    end
+    def decode(row)
+      value = row.first
+      value && Simple::SQL::Helpers::Decoder.decode_value(@field_type, value)
+    end
+  end
+  class MultiColumns
+    H = ::Simple::SQL::Helpers
+    def initialize(column_info)
+      @field_types = H.pluck(column_info, :pg_type_name)
+    end
+    def decode(row)
+      @field_types.zip(row).map do |field_type, value|
+        value && Simple::SQL::Helpers::Decoder.decode_value(field_type, value)
+      end
+    end
+  end
+  class HashRecord < MultiColumns
+    H = ::Simple::SQL::Helpers
+    def initialize(column_info)
+      super(column_info)
+      @field_names = H.pluck(column_info, :name)
+    end
+    def decode(row)
+      decoded_row = super(row)
+      Hash[@field_names.zip(decoded_row)]
+    end
+  end
+end
